@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/exec"
 	"path"
@@ -14,18 +15,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/minio/minio-go"
-	"github.com/minio/minio-go/pkg/credentials"
+	s3provider "github.com/rancher/rke-tools/s3provider/s3"
+	"github.com/rancher/rke-tools/types"
 	log "github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
+	"golang.org/x/net/context"
 )
 
 const (
-	backupBaseDir   = "/backup"
-	backupRetries   = 4
-	s3ServerRetries = 3
-	contentType     = "application/zip"
-	ServerPort      = "2379"
+	backupBaseDir = "/backup"
+	backupRetries = 4
+	ServerPort    = "2379"
 )
 
 var commonFlags = []cli.Flag{
@@ -69,6 +69,12 @@ var commonFlags = []cli.Flag{
 		EnvVar: "S3_BACKUP",
 	},
 	cli.StringFlag{
+		Name:   "s3-provider",
+		Usage:  "Specify etcd s3 storage provider",
+		EnvVar: "S3_PROVIDER",
+		Value:  "s3",
+	},
+	cli.StringFlag{
 		Name:   "s3-endpoint",
 		Usage:  "Specify s3 endpoint address",
 		EnvVar: "S3_ENDPOINT",
@@ -95,15 +101,6 @@ var commonFlags = []cli.Flag{
 	},
 }
 
-type backupConfig struct {
-	Backup     bool
-	Endpoint   string
-	AccessKey  string
-	SecretKey  string
-	BucketName string
-	Region     string
-}
-
 func init() {
 	log.SetOutput(os.Stderr)
 }
@@ -127,7 +124,6 @@ func main() {
 }
 
 func RollingBackupCommand() cli.Command {
-
 	snapshotFlags := []cli.Flag{
 		cli.DurationFlag{
 			Name:  "creation",
@@ -224,39 +220,25 @@ func RollingBackupAction(c *cli.Context) error {
 	}).Info("Initializing Rolling Backups")
 
 	s3Backup := c.Bool("s3-backup")
-	bc := &backupConfig{
-		Backup:     s3Backup,
+	bc := &types.BackupOpts{
+		Enabled:    s3Backup,
 		Endpoint:   c.String("s3-endpoint"),
 		AccessKey:  c.String("s3-accessKey"),
 		SecretKey:  c.String("s3-secretKey"),
 		BucketName: c.String("s3-bucketName"),
 		Region:     c.String("s3-region"),
-	}
-
-	client := &minio.Client{}
-	if s3Backup {
-		svc, err := setS3Service(bc, true)
-		if err != nil {
-			log.WithFields(log.Fields{
-				"s3-endpoint":   bc.Endpoint,
-				"s3-bucketName": bc.BucketName,
-				"s3-accessKey":  bc.AccessKey,
-				"s3-region":     bc.Region,
-			}).Errorf("failed to set s3 server: %s", err)
-			return fmt.Errorf("faield to set s3 server: %+v", err)
-		}
-		client = svc
+		Provider:   c.String("s3-provider"),
+		Name:       c.String("name"),
 	}
 
 	if c.Bool("once") {
-		backupName := c.String("name")
-		if len(backupName) == 0 {
-			backupName = fmt.Sprintf("%s_etcd", time.Now().Format(time.RFC3339))
+		if len(bc.Name) == 0 {
+			bc.Name = fmt.Sprintf("%s_etcd", time.Now().Format(time.RFC3339))
 		}
-		if err := CreateBackup(backupName, etcdCACert, etcdCert, etcdKey, etcdEndpoints, client, bc); err != nil {
+		if err := CreateBackup(etcdCACert, etcdCert, etcdKey, etcdEndpoints, bc); err != nil {
 			return err
 		}
-		prefix := getNamePrefix(backupName)
+		prefix := getNamePrefix(bc.Name)
 		// we only clean named backups if we have a retention period and a cluster name prefix
 		if retentionPeriod != 0 && len(prefix) != 0 {
 			if err := DeleteNamedBackups(retentionPeriod, prefix); err != nil {
@@ -265,24 +247,27 @@ func RollingBackupAction(c *cli.Context) error {
 		}
 		return nil
 	}
-	backupTicker := time.NewTicker(creationPeriod)
+
+	// routine retention and removes
+	timeoutCtx, cancel := context.WithCancel(context.Background())
+	ticker := TickerContext(timeoutCtx, creationPeriod)
+	defer cancel()
 	for {
 		select {
-		case backupTime := <-backupTicker.C:
-			backupName := fmt.Sprintf("%s_etcd", backupTime.Format(time.RFC3339))
-			CreateBackup(backupName, etcdCACert, etcdCert, etcdKey, etcdEndpoints, client, bc)
+		case backupTime := <-ticker:
+			bc.Name = fmt.Sprintf("%s_etcd", backupTime.Format(time.RFC3339))
+			CreateBackup(etcdCACert, etcdCert, etcdKey, etcdEndpoints, bc)
 			DeleteBackups(backupTime, retentionPeriod)
 			if s3Backup {
-				DeleteS3Backups(backupTime, retentionPeriod, client, bc)
+				DeleteRemoteBackups(backupTime, retentionPeriod, bc)
 			}
 		}
 	}
 }
 
-func CreateBackup(backupName string, etcdCACert, etcdCert, etcdKey, endpoints string, svc *minio.Client, server *backupConfig) error {
+func CreateBackup(etcdCACert, etcdCert, etcdKey, endpoints string, bc *types.BackupOpts) error {
 	failureInterval := 15 * time.Second
-	backupDir := fmt.Sprintf("%s/%s", backupBaseDir, backupName)
-	var err error
+	backupDir := fmt.Sprintf("%s/%s", backupBaseDir, bc.Name)
 	for retries := 0; retries <= backupRetries; retries++ {
 		if retries > 0 {
 			time.Sleep(failureInterval)
@@ -324,19 +309,34 @@ func CreateBackup(backupName string, etcdCACert, etcdCert, etcdKey, endpoints st
 			continue
 		}
 		log.WithFields(log.Fields{
-			"name":    backupName,
+			"name":    bc.Name,
 			"runtime": endTime.Sub(startTime),
 		}).Info("Created backup")
 
-		if server.Backup {
-			err := uploadBackupFile(svc, server.BucketName, backupName, backupDir)
-			if err == nil {
+		if bc.Enabled {
+			switch bc.Provider {
+			case "s3":
+				s3sp, err := s3provider.NewStorageProvider(bc)
+				if err != nil {
+					return err
+				}
+				return s3sp.Upload(bc, backupDir)
+			case "oss":
+				s3sp, err := s3provider.NewStorageProvider(bc)
+				if err != nil {
+					return err
+				}
+				return s3sp.Upload(bc, backupDir)
+			case "gcs":
+				log.Info("gcs storage provider is not implemented")
 				return nil
+			default:
+				return fmt.Errorf("invalid name of storage provider: %s", bc.Provider)
 			}
 		}
 		break
 	}
-	return err
+	return nil
 }
 
 func DeleteBackups(backupTime time.Time, retentionPeriod time.Duration) {
@@ -394,107 +394,31 @@ func DeleteBackup(file os.FileInfo) error {
 	return nil
 }
 
-func DeleteS3Backups(backupTime time.Time, retentionPeriod time.Duration, svc *minio.Client, bc *backupConfig) {
+func DeleteRemoteBackups(backupTime time.Time, retentionPeriod time.Duration, bc *types.BackupOpts) {
 	log.WithFields(log.Fields{
 		"retention": retentionPeriod,
 	}).Info("Invoking delete s3 backup files")
-	var backupDeleteList []string
-
-	cutoffTime := backupTime.Add(retentionPeriod * -1)
-
-	// Create a done channel to control 'ListObjectsV2' go routine.
-	doneCh := make(chan struct{})
-
-	// Indicate to our routine to exit cleanly upon return.
-	defer close(doneCh)
-
-	isRecursive := false
-	objectCh := svc.ListObjectsV2(bc.BucketName, "", isRecursive, doneCh)
-	re := regexp.MustCompile(".+_etcd$")
-	for object := range objectCh {
-		if object.Err != nil {
-			log.Error("error to fetch s3 file:", object.Err)
+	switch bc.Provider {
+	case "s3":
+		s3sp, err := s3provider.NewStorageProvider(bc)
+		if err != nil {
 			return
 		}
-		// only parse backup file names that matches *_etcd format
-		if re.MatchString(object.Key) {
-			backupTime, err := time.Parse(time.RFC3339, strings.Split(object.Key, "_")[0])
-			if err != nil {
-				log.WithFields(log.Fields{
-					"name":  object.Key,
-					"error": err,
-				}).Warn("Couldn't parse s3 backup")
-
-			} else if backupTime.Before(cutoffTime) {
-				backupDeleteList = append(backupDeleteList, object.Key)
-			}
-		}
-	}
-
-	for i := range backupDeleteList {
-		log.Info("Start to delete s3 backup file:", backupDeleteList[i])
-		err := svc.RemoveObject(bc.BucketName, backupDeleteList[i])
+		s3sp.Remove(backupTime, retentionPeriod, bc)
+		return
+	case "oss":
+		s3sp, err := s3provider.NewStorageProvider(bc)
 		if err != nil {
-			log.Error("Error detected during deletion: ", err)
-		} else {
-			log.Info("Success delete s3 backup file:", backupDeleteList[i])
+			return
 		}
+		s3sp.Remove(backupTime, retentionPeriod, bc)
+		return
+	case "gcs":
+		log.Info("gcs storage provider is not implemented")
+		return
+	default:
+		log.Errorf("Invalid s3 service provider %s", bc.Provider)
 	}
-}
-
-func setS3Service(bc *backupConfig, useSSL bool) (*minio.Client, error) {
-	// Initialize minio client object.
-	log.Info("invoking set s3 service client")
-	var err error
-	var svc = &minio.Client{}
-
-	for retries := 0; retries <= s3ServerRetries; retries++ {
-		// if the s3 access key and secret is not set use iam role
-		if len(bc.AccessKey) == 0 && len(bc.SecretKey) == 0 {
-			log.Info("invoking set s3 service client use IAM role")
-			iam := credentials.NewIAM("")
-			svc, err = minio.NewWithCredentials("s3.amazonaws.com", iam, true, "")
-		} else if len(bc.Region) != 0 {
-			svc, err = minio.NewWithRegion(bc.Endpoint, bc.AccessKey, bc.SecretKey, useSSL, bc.Region)
-		} else {
-			svc, err = minio.New(bc.Endpoint, bc.AccessKey, bc.SecretKey, useSSL)
-		}
-		if err != nil {
-			log.Infof("failed to init s3 client server: %v, retried %d times", err, retries)
-			if retries >= s3ServerRetries {
-				return nil, fmt.Errorf("failed to set s3 server: %v", err)
-			}
-			continue
-		}
-		break
-	}
-
-	found, err := svc.BucketExists(bc.BucketName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check s3 bucket:%s, err:%v", bc.BucketName, err)
-	}
-	if !found {
-		return nil, fmt.Errorf("bucket %s is not found", bc.BucketName)
-	}
-	return svc, nil
-}
-
-func uploadBackupFile(svc *minio.Client, bucketName, fileName, filePath string) error {
-	// Upload the zip file with FPutObject
-	log.Infof("invoking uploading backup file %s to s3", fileName)
-	for retries := 0; retries <= s3ServerRetries; retries++ {
-		n, err := svc.FPutObject(bucketName, fileName, filePath, minio.PutObjectOptions{ContentType: contentType})
-		if err != nil {
-			log.Infof("failed to upload etcd snapshot file: %v, retried %d times", err, retries)
-			if retries >= s3ServerRetries {
-				return fmt.Errorf("failed to upload etcd snapshot file: %v", err)
-			}
-			continue
-		}
-		log.Infof("Successfully uploaded %s of size %d\n", fileName, n)
-		break
-	}
-	return nil
 }
 
 func DownloadBackupAction(c *cli.Context) error {
@@ -507,42 +431,39 @@ func DownloadBackupAction(c *cli.Context) error {
 }
 
 func DownloadS3Backup(c *cli.Context) error {
-	bc := &backupConfig{
+	bc := &types.BackupOpts{
+		Name:       c.String("name"),
 		Endpoint:   c.String("s3-endpoint"),
 		AccessKey:  c.String("s3-accessKey"),
 		SecretKey:  c.String("s3-secretKey"),
 		BucketName: c.String("s3-bucketName"),
 		Region:     c.String("s3-region"),
+		Provider:   c.String("s3-provider"),
 	}
 
-	client, err := setS3Service(bc, true)
-	if err != nil {
-		log.WithFields(log.Fields{
-			"s3-endpoint":   bc.Endpoint,
-			"s3-bucketName": bc.BucketName,
-			"s3-accessKey":  bc.AccessKey,
-			"s3-region":     bc.Region,
-		}).Errorf("failed to set s3 server: %s", err)
-		return fmt.Errorf("faield to set s3 server: %+v", err)
-	}
-
-	fileName := c.String("name")
-	if len(fileName) == 0 {
+	if len(bc.Name) == 0 {
 		return fmt.Errorf("empty file name")
 	}
 
-	log.Infof("invoking downloading backup files: %s", fileName)
-	for retries := 0; retries <= s3ServerRetries; retries++ {
-		err := client.FGetObject(bc.BucketName, fileName, backupBaseDir+"/"+fileName, minio.GetObjectOptions{})
+	log.Infof("Invoking downloading backup files: %s", bc.Name)
+	switch bc.Provider {
+	case "s3":
+		s3sp, err := s3provider.NewStorageProvider(bc)
 		if err != nil {
-			log.Infof("failed to download etcd snapshot file: %v, retried %d times", err, retries)
-			if retries >= s3ServerRetries {
-				return fmt.Errorf("failed to download etcd snapshot file: %v", err)
-			}
-			continue
+			return err
 		}
-		log.Infof("Successfully download %s from s3 server", fileName)
-		break
+		return s3sp.Download(bc, backupBaseDir)
+	case "oss":
+		s3sp, err := s3provider.NewStorageProvider(bc)
+		if err != nil {
+			return err
+		}
+		return s3sp.Download(bc, backupBaseDir)
+	case "gcs":
+		log.Info("gcs storage provider is not implemented")
+		return nil
+	default:
+		return fmt.Errorf("invalid name of storage provider: %s", bc.Provider)
 	}
 	return nil
 }
@@ -675,4 +596,14 @@ func setupTLSConfig(certs map[string]string, isServer bool) (*tls.Config, error)
 
 	tlsConfig.BuildNameToCertificate()
 	return tlsConfig, nil
+}
+
+// TickerContext implements context time ticker func
+func TickerContext(ctx context.Context, duration time.Duration) <-chan time.Time {
+	ticker := time.NewTicker(duration)
+	go func() {
+		<-ctx.Done()
+		ticker.Stop()
+	}()
+	return ticker.C
 }
